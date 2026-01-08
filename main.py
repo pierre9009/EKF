@@ -2,7 +2,7 @@ import time
 import numpy as np
 import rerun as rr
 from ekf import EKF  # Ton fichier EKF
-from imu_driver import ImuReader # Ton driver
+from imu_api import ImuReader # Ton driver
 
 def main():
     # 1. Initialisation de Rerun
