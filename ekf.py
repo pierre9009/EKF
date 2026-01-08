@@ -309,13 +309,14 @@ class EKF:
 
         z = imu_data['accel'].reshape((3,1))
 
-        h = Utils.quaternion_to_rotation_matrix(self.x[0:4]).T @ np.array([[0], [0], [GRAVITY]])
+        h = Utils.quaternion_to_rotation_matrix(self.x[0:4]).T @ np.array([[0], [0], [-GRAVITY]])
 
         y = z - h
 
         H_jaco = np.array([[-2*q2*GRAVITY, 2*q3*GRAVITY, -2*q0*GRAVITY, 2*q1*GRAVITY],
                       [2*q1*GRAVITY, 2*q0*GRAVITY, 2*q3*GRAVITY, 2*q2*GRAVITY],
                       [0, -4*q1*GRAVITY, -4*q2*GRAVITY, 0]])
+        H_jaco = -1*H_jaco
         H = np.hstack((H_jaco, np.zeros((3,12))))
 
         S = H @ self.P @ H.T + self.R_accel
