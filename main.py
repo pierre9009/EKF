@@ -37,16 +37,14 @@ def main():
             dt = current_time - last_time
             last_time = current_time
             
-            accel = np.array([data['ax'], -data['ay'], -data['az']]).reshape(3, 1)
-            gyro = np.array([data['gx'], data['gy'], data['gz']]).reshape(3, 1)
-            mag = np.array([data['mx'], data['my'], data['mz']]).reshape(3, 1)
+            accel = np.array([data['ax'], -data['ay'], -data['az']])
+            gyro = np.array([data['gx'], data['gy'], data['gz']])
+            mag = np.array([data['mx'], data['my'], data['mz']])
             
             imu_data = {'accel': accel, 'gyro': gyro, 'mag': mag}
             
             if not ekf.isInitialized:
-                progress = ekf.compute_initial_state(imu_data)
-                if progress is not None:
-                    rr.log("debug/calib_progress", rr.Scalars(progress * 100))
+                ekf.compute_initial_state(imu_data)
                 continue
             
             ekf.predict(imu_data, dt)
@@ -63,7 +61,7 @@ def log_to_rerun(ekf, raw_data):
     bg = ekf.x[10:13].flatten()
     ba = ekf.x[13:16].flatten()
     
-    rr_quat = [q[1], q[2], q[3], q[0]]
+    rr_quat = [q[1].item(), q[2].item(), q[3].item(), q[0].item()]
     
     rr.log(
         "world/glider",
@@ -78,14 +76,14 @@ def log_to_rerun(ekf, raw_data):
         rr.Boxes3D(half_sizes=[0.5, 0.2, 0.05], colors=[0, 255, 0])
     )
     
-    rr.log("telemetry/velocity_norm", rr.Scalars(np.linalg.norm(vel)))
-    rr.log("telemetry/altitude", rr.Scalars(pos[2]))
+    rr.log("telemetry/velocity_norm", rr.Scalars(np.linalg.norm(vel).item()))
+    rr.log("telemetry/altitude", rr.Scalars(pos[2].item()))
     
-    rr.log("debug/bias/gyro_x", rr.Scalars(bg[0]))
-    rr.log("debug/bias/gyro_y", rr.Scalars(bg[1]))
-    rr.log("debug/bias/gyro_z", rr.Scalars(bg[2]))
+    rr.log("debug/bias/gyro_x", rr.Scalars(bg[0].item()))
+    rr.log("debug/bias/gyro_y", rr.Scalars(bg[1].item()))
+    rr.log("debug/bias/gyro_z", rr.Scalars(bg[2].item()))
     
-    rr.log("debug/accel_raw_norm", rr.Scalars(np.linalg.norm([raw_data['ax'], raw_data['ay'], raw_data['az']])))
+    rr.log("debug/accel_raw_norm", rr.Scalars(np.linalg.norm([raw_data['ax'], raw_data['ay'], raw_data['az']]).item()))
 
 if __name__ == "__main__":
     main()
