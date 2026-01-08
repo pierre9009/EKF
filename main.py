@@ -89,7 +89,8 @@ def log_to_rerun(ekf, raw_data):
     """ Centralise l'envoi des données à Rerun avec métriques EKF complètes """
     
     q = ekf.x[0:4].flatten()
-    pos = ekf.x[4:7].flatten()
+    #pos = ekf.x[4:7].flatten()
+    pos=np.zeros((1,3)).flatten()
     vel = ekf.x[7:10].flatten()
     bg = ekf.x[10:13].flatten()
     ba = ekf.x[13:16].flatten()
