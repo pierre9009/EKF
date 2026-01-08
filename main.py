@@ -7,21 +7,18 @@ from imu_api import ImuReader
 def main():
     PC_IP = "192.168.1.144"
     
-    # Nouvelle API 0.28+
-    rec = rr.new_recording(application_id="Glider_INS_Remote")
+    # Initialisation de Rerun (version 0.28+)
+    rr.init("Glider_INS_Remote", spawn=False)
     
     print(f"📡 Tentative de connexion à {PC_IP}:9876...")
     
-    # Connexion TCP vers le viewer sur ton PC
-    rr.connect(f"{PC_IP}:9876", recording=rec, flush_timeout_sec=1.0)
-    
-    # Alternative si connect ne marche pas :
-    # rr.send(rec.to_tcp(f"{PC_IP}:9876"))
+    # CORRECTION : utiliser connect_tcp au lieu de connect
+    rr.connect_tcp(f"{PC_IP}:9876")
     
     print("✅ Connecté!")
     
     # Configuration du repère 3D
-    rr.log("world", rr.ViewCoordinates.RUB, recording=rec, static=True)
+    rr.log("world", rr.ViewCoordinates.RUB, static=True)
     
     # Initialisation des composants
     imu = ImuReader(port="/dev/ttyS0", baudrate=115200)
@@ -50,15 +47,15 @@ def main():
             if not ekf.isInitialized:
                 progress = ekf.compute_initial_state(imu_data)
                 if progress is not None:
-                    rr.log("debug/calib_progress", rr.Scalar(progress * 100), recording=rec)
+                    rr.log("debug/calib_progress", rr.Scalar(progress * 100))
                 continue
             
             ekf.predict(imu_data, dt)
             ekf.update(imu_data, gps_data=None, phase="glide")
             
-            log_to_rerun(ekf, data, rec)
+            log_to_rerun(ekf, data)
 
-def log_to_rerun(ekf, raw_data, rec):
+def log_to_rerun(ekf, raw_data):
     """ Centralise l'envoi des données à Rerun """
     
     q = ekf.x[0:4].flatten()
@@ -76,27 +73,25 @@ def log_to_rerun(ekf, raw_data, rec):
         rr.Transform3D(
             translation=pos,
             rotation=rr.Quaternion(xyzw=rr_quat)
-        ),
-        recording=rec
+        )
     )
     
     rr.log(
         "world/glider/body", 
-        rr.Boxes3D(half_sizes=[0.5, 0.2, 0.05], colors=[0, 255, 0]),
-        recording=rec
+        rr.Boxes3D(half_sizes=[0.5, 0.2, 0.05], colors=[0, 255, 0])
     )
     
     # Télémétrie
-    rr.log("telemetry/velocity_norm", rr.Scalar(np.linalg.norm(vel)), recording=rec)
-    rr.log("telemetry/altitude", rr.Scalar(pos[2]), recording=rec)
+    rr.log("telemetry/velocity_norm", rr.Scalar(np.linalg.norm(vel)))
+    rr.log("telemetry/altitude", rr.Scalar(pos[2]))
     
     # Biais
-    rr.log("debug/bias/gyro_x", rr.Scalar(bg[0]), recording=rec)
-    rr.log("debug/bias/gyro_y", rr.Scalar(bg[1]), recording=rec)
-    rr.log("debug/bias/gyro_z", rr.Scalar(bg[2]), recording=rec)
+    rr.log("debug/bias/gyro_x", rr.Scalar(bg[0]))
+    rr.log("debug/bias/gyro_y", rr.Scalar(bg[1]))
+    rr.log("debug/bias/gyro_z", rr.Scalar(bg[2]))
     
     # Données brutes
-    rr.log("debug/accel_raw_norm", rr.Scalar(np.linalg.norm([raw_data['ax'], raw_data['ay'], raw_data['az']])), recording=rec)
+    rr.log("debug/accel_raw_norm", rr.Scalar(np.linalg.norm([raw_data['ax'], raw_data['ay'], raw_data['az']])))
 
 if __name__ == "__main__":
     main()
