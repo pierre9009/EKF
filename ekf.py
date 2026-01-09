@@ -44,7 +44,7 @@ class EKF:
         
         # 3. Bruit de processus (16, 16)
         self.Q = np.diag([
-            1e-4, 1e-4, 1e-4, 1e-4,      # quaternion
+            1e-5, 1e-5, 1e-5, 1e-5,      # quaternion
             1e-2, 1e-2, 1e-2,            # position
             5e-3, 5e-3, 5e-3,            # vitesse
             1e-8, 1e-8, 1e-8,            # biais gyro
@@ -53,7 +53,7 @@ class EKF:
         
         # 4. Bruits de mesure (multiples) (à ajuster selon datasheet)
         self.R_gps = np.diag([25, 25, 100, 0.25, 0.25, 0.64])
-        self.R_accel = np.diag([0.1, 0.1, 0.1])
+        self.R_accel = np.diag([0.5, 0.5, 0.5])
         self.R_heading = (5 * np.pi/180)**2
     
     def compute_initial_state(self, imu_data, gps_data=None):
@@ -109,8 +109,8 @@ class EKF:
         b_gyro = np.mean(gyro_data, axis=0)
         
         # 2. Biais accéléro (moyenne - gravité)
-        accel_mean = np.mean(accel_data, axis=0)
-        b_accel = accel_mean - np.array([0, 0, -GRAVITY])
+        #b_accel = accel_mean - np.array([0, 0, -GRAVITY])
+        b_accel = np.zeros(3)
         
         # 3. Quaternion initial (magnéto pour yaw, roll/pitch ≈ 0)
         mag_mean = np.mean(mag_data, axis=0)
