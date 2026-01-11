@@ -11,7 +11,7 @@ GRAVITY = 9.81  # Gravitational constant (m/s^2)
 
 class EKF:
     """
-    State vector: [q0, q1, q2, q3, px, py, pz, vx, vy, vz, bgx, bgy, bgz, bax, bay, baz]
+    State vector: [q0, q1, q2, q3, mx, my, mz, px, py, pz, vx, vy, vz, bgx, bgy, bgz, bax, bay, baz]
     (quaternion + position + vitesse + biais gyro et accel)
     """
     def __init__(self, initialization_duration=30.0, sample_rate=100):
@@ -41,6 +41,7 @@ class EKF:
             1e-4, 1e-4, 1e-4,            # biais gyro
             2.5e-3, 2.5e-3, 2.5e-3       # biais accel
         ])
+        assert self.P.shape == (16, 16), f"Erreur x: shape attendue (16, 16), obtenue {self.P.shape}"
         
         # 3. Bruit de processus (16, 16)
         # Bias process noise increased to allow faster adaptation
@@ -51,16 +52,25 @@ class EKF:
             1e-6, 1e-6, 1e-6,            # biais gyro (increased from 1e-8)
             1e-4, 1e-4, 1e-4             # biais accel (increased from 1e-6)
         ])
+        assert self.Q.shape == (16, 16), f"Erreur Q: shape attendue (16, 16), obtenue {self.Q.shape}"
         
         # 4. Bruits de mesure (multiples) (à ajuster selon datasheet)
         self.R_gps = np.diag([25, 25, 100, 0.25, 0.25, 0.64])
         self.R_accel = np.diag([0.5, 0.5, 0.5])
         self.R_heading_gps = (5 * np.pi/180)**2   # GPS heading noise (~5 deg)
         self.R_heading_mag = (10 * np.pi/180)**2  # Magnetometer heading noise (~10 deg)
+
+        declination_deg = 2.85
+        inclination_deg = 61.16
+        D = np.radians(declination_deg)
+        I = np.radians(inclination_deg)
+
+        self.mag_ref = np.array([np.cos(I)*np.cos(D), np.cos(I)*np.sin(D), np.sin(I)]).reshape((3,1))
     
     def compute_initial_state(self, imu_data, gps_data=None):
         """
         Accumule échantillons pour calibration puis initialise l'état.
+        Estime roll/pitch/yaw initial ET les biais même si le planeur est incliné.
         
         Args:
             imu_data: dict avec clés 'gyro' [gx,gy,gz], 'accel' [ax,ay,az], 'mag' [mx,my,mz]
@@ -69,7 +79,6 @@ class EKF:
         Returns:
             float: progression calibration (0.0 à 1.0), ou None si terminé
         """
-            
         if self.isInitialized:
             return None
         
@@ -82,18 +91,20 @@ class EKF:
         self._calib_gyro.append(imu_data['gyro'])
         self._calib_accel.append(imu_data['accel'])
         self._calib_mag.append(imu_data['mag'])
-                               
+        
         if gps_data is not None and 'position' in gps_data:
             self._calib_gps.append(gps_data['position'])
         
-        
         n_samples = len(self._calib_gyro)
         
-        # Vérifier si calibration complète (continue seulement si on a toute les valeurs necessaires)
+        # Vérifier si calibration complète
         if n_samples < self.n_samples_needed:
             return n_samples / self.n_samples_needed
         
-        # Calcul état initial
+        # ═══════════════════════════════════════════════════════════
+        # CALCUL ÉTAT INITIAL
+        # ═══════════════════════════════════════════════════════════
+        
         gyro_data = np.array(self._calib_gyro)
         accel_data = np.array(self._calib_accel)
         mag_data = np.array(self._calib_mag)
@@ -107,46 +118,85 @@ class EKF:
         if np.max(accel_std) > 0.15:
             print(f"   ⚠️  Accéléromètre a bougé pendant calibration (std={accel_std})")
         
-        # 1. Biais gyro (moyenne at rest = bias)
+        # ───────────────────────────────────────────────────────────
+        # 1. BIAIS GYROSCOPE (simple moyenne)
+        # ───────────────────────────────────────────────────────────
         b_gyro = np.mean(gyro_data, axis=0)
-
-        # 2. Biais accéléro (moyenne - expected gravity reading)
-        # At rest level: accel should read [0, 0, -g], difference is bias
+        
+        # ───────────────────────────────────────────────────────────
+        # 2. ORIENTATION INITIALE depuis accéléromètre + magnétomètre
+        # ───────────────────────────────────────────────────────────
         accel_mean = np.mean(accel_data, axis=0)
-        b_accel = np.zeros(3)
-        
-        # 3. Quaternion initial (magnéto pour yaw, roll/pitch ≈ 0)
-        # Must use same formula as update_heading_magnetometer: atan2(-my, mx)
         mag_mean = np.mean(mag_data, axis=0)
-        yaw_0 = np.arctan2(-mag_mean[1], mag_mean[0])  # NED convention
         
-        q_0 = Utils.quaternion_from_euler(0, 0, yaw_0)
+        # Roll et Pitch depuis accéléromètre (suppose immobile)
+        # Accéléromètre mesure -g en body frame
+        ax, ay, az = accel_mean
         
-        # 4. Position initiale (moyenne GPS ou zéro)
+        roll_0 = np.arctan2(ay, az)  # Rotation autour de X
+        pitch_0 = np.arctan2(-ax, np.sqrt(ay**2 + az**2))  # Rotation autour de Y
+        
+        # Yaw depuis magnétomètre avec compensation tilt
+        # Formule tilt-compensée standard
+        mx, my, mz = mag_mean
+        
+        mag_x_comp = mx * np.cos(pitch_0) + mz * np.sin(pitch_0)
+        mag_y_comp = (mx * np.sin(roll_0) * np.sin(pitch_0) +
+                    my * np.cos(roll_0) -
+                    mz * np.sin(roll_0) * np.cos(pitch_0))
+        
+        yaw_0 = np.arctan2(-mag_y_comp, mag_x_comp)  # Convention NED
+        
+        # Quaternion initial
+        q_0 = Utils.quaternion_from_euler(roll_0, pitch_0, yaw_0)
+        
+        # ───────────────────────────────────────────────────────────
+        # 3. BIAIS ACCÉLÉROMÈTRE
+        # ───────────────────────────────────────────────────────────
+        # Gravité attendue en body frame avec l'orientation calculée
+        R_0 = Utils.quaternion_to_rotation_matrix(q_0.reshape(4, 1))
+        g_ned = np.array([0, 0, GRAVITY])
+        g_body_expected = R_0.T @ g_ned  # NED → body
+        
+        # Accéléromètre mesure -g_body (force spécifique)
+        accel_expected = -g_body_expected
+        
+        # Biais = mesure - attendu
+        b_accel = accel_mean - accel_expected
+        
+        # ───────────────────────────────────────────────────────────
+        # 4. POSITION INITIALE
+        # ───────────────────────────────────────────────────────────
         if len(self._calib_gps) > 0:
             p_0 = np.mean(self._calib_gps, axis=0)
         else:
             p_0 = np.zeros(3)
             print("   ⚠️  Pas de GPS pendant calibration, position = [0,0,0]")
-
         
-        # 5. Construire vecteur d'état [16x1]
-
+        # ───────────────────────────────────────────────────────────
+        # 5. CONSTRUIRE VECTEUR D'ÉTAT
+        # ───────────────────────────────────────────────────────────
         self.x = np.array([
-            q_0[0].item(), q_0[1].item(), q_0[2].item(), q_0[3].item(),  # quaternion (4)
-            p_0[0].item(), p_0[1].item(), p_0[2].item(),           # position (3)
-            0, 0, 0,                          # vitesse (3)
-            b_gyro[0].item(), b_gyro[1].item(), b_gyro[2].item(),  # biais gyro (3)
-            b_accel[0].item(), b_accel[1].item(), b_accel[2].item() # biais accel (3)
+            q_0[0], q_0[1], q_0[2], q_0[3],  # quaternion (4)
+            p_0[0], p_0[1], p_0[2],           # position (3)
+            0, 0, 0,                           # vitesse (3)
+            b_gyro[0], b_gyro[1], b_gyro[2],  # biais gyro (3)
+            b_accel[0], b_accel[1], b_accel[2] # biais accel (3)
         ]).reshape((16, 1))
         
         self.isInitialized = True
         
+        # ───────────────────────────────────────────────────────────
+        # AFFICHAGE RÉSULTATS
+        # ───────────────────────────────────────────────────────────
         print(f"✅ Calibration terminée!")
-        print(f"   Biais gyro:  [{b_gyro[0].item():.4f}, {b_gyro[1].item():.4f}, {b_gyro[2].item():.4f}] rad/s")
-        print(f"   Biais accel: [{b_accel[0].item():.3f}, {b_accel[1].item():.3f}, {b_accel[2].item():.3f}] m/s²")
-        print(f"   Yaw initial: {np.rad2deg(yaw_0).item():.1f}°")
-        print(f"   Position:    [{p_0[0].item():.2f}, {p_0[1].item():.2f}, {p_0[2].item():.2f}]")
+        print(f"   Orientation initiale:")
+        print(f"      Roll:  {np.rad2deg(roll_0):+7.2f}°")
+        print(f"      Pitch: {np.rad2deg(pitch_0):+7.2f}°")
+        print(f"      Yaw:   {np.rad2deg(yaw_0):+7.2f}°")
+        print(f"   Biais gyro:  [{b_gyro[0]:+.4f}, {b_gyro[1]:+.4f}, {b_gyro[2]:+.4f}] rad/s")
+        print(f"   Biais accel: [{b_accel[0]:+.3f}, {b_accel[1]:+.3f}, {b_accel[2]:+.3f}] m/s²")
+        print(f"   Position:    [{p_0[0]:.2f}, {p_0[1]:.2f}, {p_0[2]:.2f}] m")
         
         return None
 
@@ -160,37 +210,47 @@ class EKF:
             dt: pas de temps (secondes)
         """
 
+        # === 1. PREPARER LA DATA D'ENTRE ===
         q = self.x[0:4]
+        assert q.shape == (4, 1)
+
         p = self.x[4:7]
+        assert p.shape == (3, 1)
+
         v = self.x[7:10]
+        assert v.shape == (3, 1)
+
         b_gyro = self.x[10:13]
+        assert b_gyro.shape == (3, 1)
+
         b_accel = self.x[13:16]
+        assert b_accel.shape == (3, 1)
 
+        accel_meas = np.array(imu_data['accel']).reshape((3,1))
         omega_meas = np.array(imu_data['gyro']).reshape((3,1))
-        accel_meas = imu_data['accel'].reshape((3,1))
+        
 
-        omega = omega_meas - b_gyro
+        omega_body = omega_meas - b_gyro
         accel_body = accel_meas - b_accel
 
         # === 2. CALCULER JACOBIENNE AVEC ÉTAT ACTUEL ===
-        F = Utils.compute_jacobian_F(q, omega, accel_body, dt)
+        F = Utils.compute_jacobian_F(q, omega_body, accel_body, dt)
 
-        # === 3. PROPAGER COVARIANCE (Standard EKF discret) ===
+        # === 3. PROPAGER COVARIANCE ===
         self.P = F @ self.P @ F.T + self.Q
 
         # === 4. PROPAGER ÉTAT ===
 
         # 1. Propager quaternion
-        dq = 0.5 * (Utils.skew_4x4(omega) @ q)
+        dq = 0.5 * (Utils.skew_4x4(omega_body) @ q)
         q_new = q + dq * dt
         q_new = q_new / np.linalg.norm(q_new)
-
 
         # 2. Propager vitesse
         R = Utils.quaternion_to_rotation_matrix(q) #body vers NED
         accel_ned = R @ accel_body
-        gravity_ned = np.array([[0], [0], [GRAVITY]])
-        v_new = v + (accel_ned + gravity_ned) * dt
+        gravity_ned = np.array([0, 0, GRAVITY]).reshape((3,1))
+        v_new = v + (accel_ned + gravity_ned) * dt      #Immobile: on mesure la reaction à la gravité donc on ajoute la gravité pour faire 0 d'acceleration
 
         # 3. Propager position
         p_new = p + v * dt
@@ -198,6 +258,12 @@ class EKF:
         # 4. Biais constants (mais EKF les ajustera via covariance)
         b_gyro_new = b_gyro
         b_accel_new = b_accel
+
+        assert q_new.shape == (4, 1)
+        assert p_new.shape == (3, 1)
+        assert v_new.shape == (3, 1)
+        assert b_gyro_new.shape == (3, 1)
+        assert b_accel_new.shape == (3, 1)
             
         self.x = np.vstack([q_new, p_new, v_new, b_gyro_new, b_accel_new])
 
@@ -217,47 +283,95 @@ class EKF:
         if not self.isInitialized:
             return
         
-        # === PHASE LARGAGE : Gyro-only, PAS D'UPDATE ===
+        # === PHASE LARGAGE ===
+        if phase == "ascension":
+            #GPS position et vitesse
+            if gps_data is not None and 'position' in gps_data and 'velocity' in gps_data:
+                position = np.array(gps_data['position']).reshape((3,1))
+                velocity = np.array(gps_data['velocity']).reshape((3,1))
+
+                self.update_gps_position_velocity(position, velocity)
+
+            #Accel: correction roll/pitch
+            if imu_data is not None and 'accel' in imu_data:
+                accel_meas = np.array(imu_data['accel']).reshape((3,1))
+                accel_norm = np.linalg.norm(accel_meas)
+
+                # Seulement si |a| ≈ g (forces dynamiques faibles, on se raproche de la gravité seul)
+                if abs(accel_norm - GRAVITY) < 0.5:  # Seuil 0.5 m/s²
+                    self.update_accel_gravity(accel_meas)
+
+            #Magnetometre : correction du cap 
+            if imu_data is not None and 'mag' in imu_data:
+                mag = np.array(imu_data['mag']).reshape((3,1))
+                self.update_heading_mag(mag)
+            return
+        
+        # === PHASE LARGAGE ===
         if phase == "drop":
-            return  # Ne faire aucune correction pendant le largage
-        
-        # === UPDATE GPS (Position + Vitesse) ===
-        if gps_data is not None and 'position' in gps_data and 'velocity' in gps_data:
-            self.update_gps_position_velocity(gps_data)
-        
-        # === UPDATE ACCÉLÉROMÈTRE (Roll/Pitch via gravité) ===
-        if imu_data is not None and 'accel' in imu_data:
-            # Vérifier conditions : vol quasi-rectiligne
-            accel_meas = imu_data['accel']
-            accel_norm = np.linalg.norm(accel_meas)
-            
-            # GATING : Seulement si |a| ≈ g (forces dynamiques faibles)
-            if abs(accel_norm - GRAVITY) < 0.5:  # Seuil 0.5 m/s²
-                self.update_accel_gravity(imu_data)
-        
-        # === UPDATE HEADING ===
-        # Priority 1: GPS Heading (if conditions OK)
-        # Priority 2: Magnetometer (fallback)
+            # Priorité roll pitch
 
-        gps_heading_used = False
+            # UPDATE ACCÉLÉROMÈTRE (Roll/Pitch via gravité)
+            if imu_data is not None and 'accel' in imu_data:
+                accel_meas = np.array(imu_data['accel']).reshape((3,1))
+                accel_norm = np.linalg.norm(accel_meas)
+                # Seulement si |a| ≈ g (forces dynamiques faibles, on se raproche de la gravité seul)
+                if abs(accel_norm - GRAVITY) < 0.5:  # Seuil 0.5 m/s²
+                    self.update_accel_gravity(accel_meas)
 
-        # Try GPS heading first
-        if gps_data is not None and 'velocity' in gps_data:
-            v_gps = gps_data['velocity']
-            v_horizontal = np.sqrt(v_gps[0]**2 + v_gps[1]**2)
+            # UPDATE GPS (Position + Vitesse)
+            if gps_data is not None and 'position' in gps_data and 'velocity' in gps_data:
+                position = np.array(gps_data['position']).reshape((3,1))
+                velocity = np.array(gps_data['velocity']).reshape((3,1))
 
-            # Extract pitch to check angle
-            q = self.x[0:4]
-            pitch = Utils._get_pitch_from_quaternion(q)
+                self.update_gps_position_velocity(position, velocity)
 
-            # GPS heading conditions:
-            # 1. Sufficient horizontal speed (> 5 m/s)
-            # 2. No extreme pitch (|pitch| < 30°)
-            # 3. Glide phase (not ascent with low speed)
-            if v_horizontal > 5.0 and abs(pitch) < np.radians(30) and phase == "glide":
-                self.update_heading_gps(gps_data)
+            #Magnetometre : correction du cap 
+            if imu_data is not None and 'mag' in imu_data:
+                mag = np.array(imu_data['mag']).reshape((3,1))
+                self.update_heading_mag(mag)
+
+            return 
         
-    def update_gps_position_velocity(self, gps_data):
+        # === PHASE LARGAGE ===
+        if phase == "glide":
+            # UPDATE GPS (Position + Vitesse)
+            if gps_data is not None and 'position' in gps_data and 'velocity' in gps_data:
+                position = np.array(gps_data['position']).reshape((3,1))
+                velocity = np.array(gps_data['velocity']).reshape((3,1))
+
+                self.update_gps_position_velocity(position, velocity)
+
+
+            # UPDATE ACCÉLÉROMÈTRE (Roll/Pitch via gravité)
+            if imu_data is not None and 'accel' in imu_data:
+                accel_meas = np.array(imu_data['accel']).reshape((3,1))
+                accel_norm = np.linalg.norm(accel_meas)
+                # Seulement si |a| ≈ g (forces dynamiques faibles, on se raproche de la gravité seul)
+                if abs(accel_norm - GRAVITY) < 0.5:  # Seuil 0.5 m/s²
+                    self.update_accel_gravity(accel_meas)
+
+
+            # UPDATE HEADING 
+            if gps_data is not None and 'velocity' in gps_data:
+                v_gps = np.array(gps_data['velocity']).reshape((3,1))
+                v_horizontal = np.sqrt(v_gps[0]**2 + v_gps[1]**2)
+
+                # GPS heading conditions: Sufficient horizontal speed (> 5 m/s)
+                if v_horizontal > 5.0:
+                    self.update_heading_gps(v_gps)
+                else:
+                    if imu_data is not None and 'mag' in imu_data:
+                        mag = np.array(imu_data['mag']).reshape((3,1))
+                        self.update_heading_mag(mag)
+
+            elif imu_data is not None and 'mag' in imu_data:
+                mag = np.array(imu_data['mag']).reshape((3,1))
+                self.update_heading_mag(mag)
+            return
+
+        
+    def update_gps_position_velocity(self, position, velocity):
         """
         Update EKF avec mesures GPS position + vitesse.
         
@@ -269,8 +383,8 @@ class EKF:
         
         # 1. Extraire mesure GPS (6×1)
         z = np.vstack([
-            gps_data['position'],   # [px, py, pz]
-            gps_data['velocity']    # [vx, vy, vz]
+            position,   # [px, py, pz]
+            velocity    # [vx, vy, vz]
         ])
         
         # 2. Prédiction de la mesure h(x) = [p, v]
@@ -292,6 +406,7 @@ class EKF:
         
         # 6. Gain de Kalman
         K = self.P @ H.T @ np.linalg.inv(S)
+        assert K.shape == (16,6)
         
         # 7. Update état
         self.x = self.x + K @ y
@@ -305,7 +420,7 @@ class EKF:
 
 
 
-    def update_accel_gravity(self, imu_data):
+    def update_accel_gravity(self, accel_meas):
         """
         Update EKF with accelerometer measurement for roll/pitch correction.
 
@@ -316,14 +431,17 @@ class EKF:
             return
 
         q = self.x[0:4]
+        assert q.shape == (4,1)
+
         q0, q1, q2, q3 = q.flatten()
         b_accel = self.x[13:16]  # Accelerometer bias
+        assert b_accel.shape == (3,1)
 
-        z = imu_data['accel'].reshape((3, 1))
+        z = accel_meas
 
         # Measurement prediction: h(x) = R^T @ [0, 0, -g]^T + b_accel
         R_T = Utils.quaternion_to_rotation_matrix(q).T  # NED → body
-        h = R_T @ np.array([[0], [0], [-GRAVITY]]) + b_accel
+        h = R_T @ np.array([0, 0, -GRAVITY]).reshape((3,1)) + b_accel       #immobile alors on doit mesurer la reaction à la gravité
 
         y = z - h
 
@@ -345,14 +463,17 @@ class EKF:
         H[:, 13:16] = np.eye(3)      # ∂h/∂b_accel = I(3×3)
 
         S = H @ self.P @ H.T + self.R_accel
+
         K = self.P @ H.T @ np.linalg.inv(S)
+        assert K.shape == (16,3)
+
         self.x = self.x + K @ y
 
         I_KH = np.eye(16) - K @ H
         self.P = I_KH @ self.P
     
     
-    def update_heading_gps(self, gps_data):
+    def update_heading_gps(self, v_gps):
         """
         Update EKF avec heading GPS (correction yaw uniquement).
         
@@ -360,10 +481,7 @@ class EKF:
             gps_data: dict avec 'velocity' [vx, vy, vz] en NED
         """
         if not self.isInitialized:
-            return
-        
-        v_gps = gps_data['velocity']
-        
+            return        
         
         # 3. Calculer heading GPS depuis vecteur vitesse
         z_heading = np.arctan2(v_gps[1], v_gps[0])
@@ -377,7 +495,7 @@ class EKF:
             2 * (q0*q3 + q1*q2),
             (q0**2 + q1**2 - q2**2 - q3**2) #phillips et al. 2001
         )
-        h_heading = np.array([[h_heading]]) 
+        h_heading = np.array([h_heading]).reshape((1, 1))
         
         # 5. Innovation avec wrap-around
         y = z_heading - h_heading
@@ -423,6 +541,7 @@ class EKF:
         
         # 9. Gain de Kalman
         K = self.P @ H.T @ np.linalg.inv(S)
+        assert K.shape == (16,1)
         
         # 10. Update état
         self.x = self.x + K @ y
@@ -433,3 +552,95 @@ class EKF:
 
         # 12. Normaliser quaternion
         self.x[0:4] = self.x[0:4] / np.linalg.norm(self.x[0:4])
+
+    def update_heading_mag(self, mag_meas):
+        """
+        Update EKF avec magnétomètre (correction yaw via champ magnétique).
+        Utilise le vecteur magnétique complet (3D) pour robustesse.
+        
+        Args:
+            mag_meas: mesure magnétomètre [mx, my, mz] en body frame (3,1)
+            mag_ref: champ magnétique de référence en NED [mx, 0, mz] (optionnel)
+                    Si None, utilise valeur par défaut Nord=[1,0,0] normalisé
+        """
+        if not self.isInitialized:
+            return
+        
+        # 1. Normaliser la mesure magnétomètre
+        mag_norm = np.linalg.norm(mag_meas)
+        if mag_norm < 1e-6:
+            # print("⚠️ Mag update skipped: norm too small")
+            return
+        
+        mag_n = mag_meas / mag_norm  # Vecteur unitaire
+        
+        # 2. Référence magnétique NED (si non fournie, utiliser Nord magnétique)
+
+        mag_ref_n = self.mag_ref / np.linalg.norm(self.mag_ref)  # Normaliser
+        
+        # 3. Prédiction : transformer mag_ref de NED vers body
+        q = self.x[0:4]
+        R = Utils.quaternion_to_rotation_matrix(q)  # Body → NED
+        R_T = R.T  # NED → Body
+        
+        h = R_T @ mag_ref_n  # Mesure attendue en body frame
+        h = h / np.linalg.norm(h)  # Normaliser (cohérent avec mag_n)
+        
+        # 4. Innovation (vecteur 3D)
+        z = mag_n
+        y = z - h
+        
+        # 5. Jacobienne H = ∂h/∂q
+        # h = R^T @ mag_ref où R = R(q)
+        # ∂h/∂q = ∂(R^T @ mag_ref)/∂q
+        
+        q0, q1, q2, q3 = q.flatten()
+        mx, my, mz = mag_ref_n.flatten()
+        
+        # Jacobienne analytique (dérivée de R^T @ mag_ref par rapport à q)
+        # Formule : ∂(R^T @ v)/∂q pour vecteur v constant
+        H_q = 2 * np.array([
+            # ∂h1/∂q (composante X body)
+            [ q0*mx + q3*my - q2*mz,  q1*mx + q2*my + q3*mz, 
+            -q2*mx + q1*my - q0*mz, -q3*mx + q0*my + q1*mz],
+            
+            # ∂h2/∂q (composante Y body)
+            [-q3*mx + q0*my + q1*mz,  q2*mx - q1*my + q0*mz,
+            q1*mx + q2*my + q3*mz,  q0*mx + q3*my - q2*mz],
+            
+            # ∂h3/∂q (composante Z body)
+            [ q2*mx - q1*my + q0*mz,  q3*mx - q0*my - q1*mz,
+            q0*mx + q3*my - q2*mz,  q1*mx + q2*my + q3*mz]
+        ])
+        
+        # Jacobienne complète H (3×16)
+        H = np.zeros((3, 16))
+        H[:, 0:4] = H_q  # Seulement quaternion est affecté
+        
+        # 6. Covariances
+        S = H @ self.P @ H.T + np.diag([self.R_heading_mag, self.R_heading_mag, self.R_heading_mag])
+        
+        # 7. Gain de Kalman
+        try:
+            K = self.P @ H.T @ np.linalg.inv(S)
+        except np.linalg.LinAlgError:
+            # print("⚠️ Mag update skipped: S singular")
+            return
+        
+        assert K.shape == (16, 3), f"K shape error: {K.shape}"
+        
+        # 8. Gating sur innovation (rejeter mesures aberrantes)
+        innovation_norm = np.linalg.norm(y)
+        if innovation_norm > 0.5:  # Seuil : 0.5 pour vecteurs normalisés ≈ 30°
+            # print(f"⚠️ Mag innovation too large: {innovation_norm:.3f}")
+            return
+        
+        # 9. Update état
+        self.x = self.x + K @ y
+        
+        # 10. Normaliser quaternion immédiatement
+        self.x[0:4] = self.x[0:4] / np.linalg.norm(self.x[0:4])
+        
+        # 11. Update covariance (forme de Joseph pour stabilité)
+        I_KH = np.eye(16) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ np.diag([self.R_heading_mag]*3) @ K.T

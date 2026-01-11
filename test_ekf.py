@@ -467,7 +467,7 @@ def test_gps_update():
         'velocity': np.array([[0.0], [0.0], [0.0]])
     }
 
-    ekf.update_gps_position_velocity(gps_data)
+    ekf.update_gps_position_velocity(gps_data["position"],gps_data["velocity"])
 
     # After update, state should move towards GPS measurement
     # (not exactly equal due to Kalman gain < 1)
@@ -518,7 +518,7 @@ def test_accel_gravity_update():
 
     # Apply update multiple times
     for _ in range(10):
-        ekf.update_accel_gravity(imu_data)
+        ekf.update_accel_gravity(imu_data['accel'].reshape((3,1)))
 
     roll_after, pitch_after, _ = Utils.quaternion_to_euler(ekf.x[0:4].flatten())
 
@@ -557,7 +557,7 @@ def test_heading_updates():
 
     # Apply update
     for _ in range(5):
-        ekf.update_heading_gps(gps_data)
+        ekf.update_heading_gps(gps_data["velocity"])
 
     yaw_after = Utils.quaternion_to_euler(ekf.x[0:4].flatten())[2]
 
@@ -597,7 +597,7 @@ def test_jacobian():
     dt = 0.01
 
     # Get analytical Jacobian
-    F_analytical = Utils.compute_jacobian_F(q, omega, accel, b_accel, b_gyro, dt)
+    F_analytical = Utils.compute_jacobian_F(q, omega, accel, dt)
 
     # Verify F is 16x16
     all_passed &= (F_analytical.shape == (16, 16))

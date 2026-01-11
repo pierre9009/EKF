@@ -62,33 +62,15 @@ class Utils:
         return R
 
     def skew_4x4(x):
-        x0 = x[0].item()
-        x1 = x[1].item()
-        x2 = x[2].item()
+        x0 = x[0,0]
+        x1 = x[1,0]
+        x2 = x[2,0]
         result = np.array([[0, -x0, -x1, -x2],
                            [x0, 0, x2, -x1],
                            [x1, -x2, 0, x0],
                            [x2, x1, -x0, 0]])
         return result
-    
-    def _get_pitch_from_quaternion(q):
-        """
-        Extrait le pitch (tangage) depuis un quaternion.
-        
-        Returns:
-            pitch en radians
-        """
-        q0, q1, q2, q3 = q.flatten()
-        
-        # Formule standard pour pitch
-        sin_pitch = 2 * (q0*q2 - q3*q1)
-        
-        # Clamp pour éviter erreurs numériques dans arcsin
-        sin_pitch = np.clip(sin_pitch, -1.0, 1.0)
-        
-        pitch = np.arcsin(sin_pitch)
-        
-        return pitch
+
     
     def compute_jacobian_F(q, omega, accel_body, dt):
         """
@@ -96,18 +78,18 @@ class Utils:
         """
         F = np.eye(16)
 
-        q0 = q[0].item()
-        q1 = q[1].item()
-        q2 = q[2].item()
-        q3 = q[3].item()
+        q0 = q[0,0]
+        q1 = q[1,0]
+        q2 = q[2,0]
+        q3 = q[3,0]
 
-        wcx = (omega[0]).item()
-        wcy = (omega[1]).item()
-        wcz = (omega[2]).item()
+        wcx = omega[0,0]
+        wcy = omega[1,0]
+        wcz = omega[2,0]
 
-        acx = (accel_body[0]).item()
-        acy = (accel_body[1]).item()
-        acz = (accel_body[2]).item()
+        acx = accel_body[0,0]
+        acy = accel_body[1,0]
+        acz = accel_body[2,0]
 
 
 
@@ -136,7 +118,9 @@ class Utils:
         F4 = np.zeros((6,16))
 
         TEMPO = np.vstack((F1, F2, F3, F4))
+        assert TEMPO.shape == (16,16)
 
         F = np.eye(16) + TEMPO*dt
+        assert F.shape == (16,16)
 
         return F
