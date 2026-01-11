@@ -41,6 +41,12 @@ def main():
     rr.log("debug/bias/accel_y", rr.SeriesLines(colors=[[150, 255, 0]], names=["Bias Accel Y"]), static=True)
     rr.log("debug/bias/accel_z", rr.SeriesLines(colors=[[200, 255, 0]], names=["Bias Accel Z"]), static=True)
 
+    rr.log("debug/bias/B_NED_x", rr.SeriesLines(colors=[[100, 255, 0]], names=["mag X"]), static=True)
+    rr.log("debug/bias/B_NED_y", rr.SeriesLines(colors=[[150, 255, 0]], names=["mag Y"]), static=True)
+    rr.log("debug/bias/B_NED_z", rr.SeriesLines(colors=[[200, 255, 0]], names=["mag Z"]), static=True)
+    rr.log("debug/bias/B_NED_norm", rr.SeriesLines(colors=[[200, 255, 0]], names=["Bias mag norm"]), static=True)
+
+
     # === LOGS INCERTITUDES ===
     rr.log("debug/uncertainty/position", rr.SeriesLines(colors=[[255, 0, 255]], names=["Pos σ (m)"]), static=True)
     rr.log("debug/uncertainty/velocity", rr.SeriesLines(colors=[[0, 255, 255]], names=["Vel σ (m/s)"]), static=True)
@@ -204,6 +210,12 @@ def log_to_rerun(ekf, raw_data, dt, t_predict, t_update):
     rr.log("debug/bias/accel_x", rr.Scalars([float(ba[0])]))
     rr.log("debug/bias/accel_y", rr.Scalars([float(ba[1])]))
     rr.log("debug/bias/accel_z", rr.Scalars([float(ba[2])]))
+    B_NED = ekf.x[16:19].flatten()
+
+    rr.log("debug/mag/B_NED_x", rr.Scalars([float(B_NED[0])]))
+    rr.log("debug/mag/B_NED_y", rr.Scalars([float(B_NED[1])]))
+    rr.log("debug/mag/B_NED_z", rr.Scalars([float(B_NED[2])]))
+    rr.log("debug/mag/B_NED_norm", rr.Scalars([float(np.linalg.norm(B_NED))]))
     
     # === 5. INCERTITUDES ===
     pos_var = np.diag(ekf.P[4:7, 4:7])

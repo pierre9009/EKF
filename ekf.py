@@ -11,18 +11,15 @@ GRAVITY = 9.81  # Gravitational constant (m/s^2)
 
 class EKF:
     """
-    State vector: [q0, q1, q2, q3, mx, my, mz, px, py, pz, vx, vy, vz, bgx, bgy, bgz, bax, bay, baz]
+    State vector: [q(4), p(3), v(3), b_gyro(3), b_accel(3), B_NED(3)]
     (quaternion + position + vitesse + biais gyro et accel)
     """
     def __init__(self, initialization_duration=30.0, sample_rate=100):
+
         """
-        Create a new EKF instance.
-        
-        Args:
-            initialization_duration: Durée calibration en secondes
-            sample_rate: Fréquence échantillonnage IMU en Hz
+        State vector: [q(4), p(3), v(3), b_gyro(3), b_accel(3), B_NED(3)]
+        Total: 19 états
         """
-        # État d'initialisation
         self.isInitialized = False
         self.n_samples_needed = int(initialization_duration * sample_rate)
         self._calib_gyro = []
@@ -30,43 +27,51 @@ class EKF:
         self._calib_mag = []
         self._calib_gps = []
         
-        # Initialize state vector [q0, q1, q2, q3, px, py, pz, vx, vy, vz, bgx, bgy, bgz, bax, bay, baz]
-        self.x = np.zeros((16, 1))
-        self._q_previous = None  # Pour continuité
+        # ✅ État étendu à 19 (ajout B_NED)
+        self.x = np.zeros((19, 1))
         
-        # 2. Covariance initiale (16, 16)
+        # ✅ Covariance 19×19
         self.P = np.diag([
             0.01, 0.01, 0.01, 0.01,     # quaternion
             25, 25, 100,                 # position
             0.01, 0.01, 0.01,            # vitesse
             1e-4, 1e-4, 1e-4,            # biais gyro
-            2.5e-3, 2.5e-3, 2.5e-3       # biais accel
+            2.5e-3, 2.5e-3, 2.5e-3,      # biais accel
+            0.01, 0.01, 0.01             # ✅ B_NED (incertitude initiale 10%)
         ])
-        assert self.P.shape == (16, 16), f"Erreur x: shape attendue (16, 16), obtenue {self.P.shape}"
+        assert self.P.shape == (19, 19)
         
-        # 3. Bruit de processus (16, 16)
-        # Bias process noise increased to allow faster adaptation
+        # ✅ Bruit processus 19×19
         self.Q = np.diag([
             1e-5, 1e-5, 1e-5, 1e-5,      # quaternion
             1e-2, 1e-2, 1e-2,            # position
             5e-3, 5e-3, 5e-3,            # vitesse
-            1e-6, 1e-6, 1e-6,            # biais gyro (increased from 1e-8)
-            1e-4, 1e-4, 1e-4             # biais accel (increased from 1e-6)
+            1e-7, 1e-7, 1e-7,            # biais gyro
+            1e-8, 1e-8, 1e-8,            # biais accel (réduit)
+            1e-10, 1e-10, 1e-10          # ✅ B_NED (quasi-constant)
         ])
-        assert self.Q.shape == (16, 16), f"Erreur Q: shape attendue (16, 16), obtenue {self.Q.shape}"
+        assert self.Q.shape == (19, 19)
         
-        # 4. Bruits de mesure (multiples) (à ajuster selon datasheet)
+        # Bruits de mesure
         self.R_gps = np.diag([25, 25, 100, 0.25, 0.25, 0.64])
         self.R_accel = np.diag([0.5, 0.5, 0.5])
-        self.R_heading_gps = (20 * np.pi/180)**2   # GPS heading noise (~5 deg)
-        self.R_heading_mag = (30 * np.pi/180)**2  # Magnetometer heading noise (~10 deg)
-
+        self.R_heading_gps = (5 * np.pi/180)**2
+        self.R_heading_mag = (20 * np.pi/180)**2  # Plus conservateur
+        
+        # ✅ Initialisation B_NED (sera affinée par filtre)
         declination_deg = 2.85
         inclination_deg = 61.16
         D = np.radians(declination_deg)
         I = np.radians(inclination_deg)
-
-        self.mag_ref = np.array([np.cos(I)*np.cos(D), np.cos(I)*np.sin(D), np.sin(I)]).reshape((3,1))
+        
+        self.mag_ref_init = np.array([
+            np.cos(I)*np.cos(D), 
+            np.cos(I)*np.sin(D), 
+            np.sin(I)
+        ]).reshape((3,1))
+        
+        # Pour continuité quaternion
+        self._q_previous = None
     
     def compute_initial_state(self, imu_data, gps_data=None):
         """
@@ -175,23 +180,32 @@ class EKF:
         else:
             p_0 = np.zeros(3)
             print("   ⚠️  Pas de GPS pendant calibration, position = [0,0,0]")
+
+        # ───────────────────────────────────────────────────────────
+        # 6. INITIALISER B_NED
+        # ───────────────────────────────────────────────────────────
+
+        B_NED_0 = self.mag_ref_init
         
         # ───────────────────────────────────────────────────────────
         # 5. CONSTRUIRE VECTEUR D'ÉTAT
         # ───────────────────────────────────────────────────────────
         self.x = np.array([
-            q_0[0], q_0[1], q_0[2], q_0[3],  # quaternion (4)
-            p_0[0], p_0[1], p_0[2],           # position (3)
-            0, 0, 0,                           # vitesse (3)
-            b_gyro[0], b_gyro[1], b_gyro[2],  # biais gyro (3)
-            b_accel[0], b_accel[1], b_accel[2] # biais accel (3)
-        ]).reshape((16, 1))
+            q_0[0], q_0[1], q_0[2], q_0[3],       # quaternion (4)
+            p_0[0], p_0[1], p_0[2],               # position (3)
+            0, 0, 0,                               # vitesse (3)
+            b_gyro[0], b_gyro[1], b_gyro[2],      # biais gyro (3)
+            b_accel[0], b_accel[1], b_accel[2],   # biais accel (3)
+            B_NED_0[0,0], B_NED_0[1,0], B_NED_0[2,0]  # ✅ B_NED (3)
+        ]).reshape((19, 1))
+
         
         self.isInitialized = True
         
         # ───────────────────────────────────────────────────────────
         # AFFICHAGE RÉSULTATS
         # ───────────────────────────────────────────────────────────
+        # Affichage
         print(f"✅ Calibration terminée!")
         print(f"   Orientation initiale:")
         print(f"      Roll:  {np.rad2deg(roll_0):+7.2f}°")
@@ -199,76 +213,81 @@ class EKF:
         print(f"      Yaw:   {np.rad2deg(yaw_0):+7.2f}°")
         print(f"   Biais gyro:  [{b_gyro[0]:+.4f}, {b_gyro[1]:+.4f}, {b_gyro[2]:+.4f}] rad/s")
         print(f"   Biais accel: [{b_accel[0]:+.3f}, {b_accel[1]:+.3f}, {b_accel[2]:+.3f}] m/s²")
+        print(f"   B_NED init:  [{B_NED_0[0,0]:+.3f}, {B_NED_0[1,0]:+.3f}, {B_NED_0[2,0]:+.3f}]")
         print(f"   Position:    [{p_0[0]:.2f}, {p_0[1]:.2f}, {p_0[2]:.2f}] m")
         
         return None
 
 
     def predict(self, imu_data, dt):
-        """
-        Propage l'état x de dt secondes en avant.
+        """Propage l'état x de dt secondes (19 états)."""
         
-        Args:
-            imu_data: dict avec 'gyro' et 'accel'
-            dt: pas de temps (secondes)
-        """
-
-        # === 1. PREPARER LA DATA D'ENTRE ===
+        # === 1. EXTRAIRE ÉTATS ===
         q = self.x[0:4]
         assert q.shape == (4, 1)
-
+        
         p = self.x[4:7]
         assert p.shape == (3, 1)
-
+        
         v = self.x[7:10]
         assert v.shape == (3, 1)
-
+        
         b_gyro = self.x[10:13]
         assert b_gyro.shape == (3, 1)
-
+        
         b_accel = self.x[13:16]
         assert b_accel.shape == (3, 1)
-
+        
+        B_NED = self.x[16:19]  # ✅ Nouveau
+        assert B_NED.shape == (3, 1)
+        
         accel_meas = np.array(imu_data['accel']).reshape((3,1))
         omega_meas = np.array(imu_data['gyro']).reshape((3,1))
         
-
         omega_body = omega_meas - b_gyro
         accel_body = accel_meas - b_accel
-
-        # === 2. CALCULER JACOBIENNE AVEC ÉTAT ACTUEL ===
-        F = Utils.compute_jacobian_F(q, omega_body, accel_body, dt)
-
+        
+        # === 2. JACOBIENNE (maintenant 19×19) ===
+        F = Utils.compute_jacobian_F_extended(q, omega_body, accel_body, dt)
+        
         # === 3. PROPAGER COVARIANCE ===
         self.P = F @ self.P @ F.T + self.Q
-
+        
         # === 4. PROPAGER ÉTAT ===
-
-        # 1. Propager quaternion
+        
+        # Quaternion
         dq = 0.5 * (Utils.skew_4x4(omega_body) @ q)
         q_new = q + dq * dt
         q_new = q_new / np.linalg.norm(q_new)
-
-        # 2. Propager vitesse
-        R = Utils.quaternion_to_rotation_matrix(q) #body vers NED
+        
+        # Vitesse
+        R = Utils.quaternion_to_rotation_matrix(q)
         accel_ned = R @ accel_body
         gravity_ned = np.array([0, 0, GRAVITY]).reshape((3,1))
-        v_new = v + (accel_ned + gravity_ned) * dt      #Immobile: on mesure la reaction à la gravité donc on ajoute la gravité pour faire 0 d'acceleration
-
-        # 3. Propager position
+        v_new = v + (accel_ned + gravity_ned) * dt
+        
+        # Position
         p_new = p + v * dt
-
-        # 4. Biais constants (mais EKF les ajustera via covariance)
+        
+        # Biais constants
         b_gyro_new = b_gyro
         b_accel_new = b_accel
-
+        
+        # ✅ B_NED constant (évolution via Q très faible)
+        B_NED_new = B_NED
+        
+        # Vérifications
         assert q_new.shape == (4, 1)
         assert p_new.shape == (3, 1)
         assert v_new.shape == (3, 1)
         assert b_gyro_new.shape == (3, 1)
         assert b_accel_new.shape == (3, 1)
-            
-        self.x = np.vstack([q_new, p_new, v_new, b_gyro_new, b_accel_new])
+        assert B_NED_new.shape == (3, 1)
+        
+        self.x = np.vstack([q_new, p_new, v_new, b_gyro_new, b_accel_new, B_NED_new])
+        
+        # ✅ Forcer continuité quaternion
+        self._enforce_quaternion_continuity()
 
         
 
@@ -399,8 +418,8 @@ class EKF:
         # 3. Innovation
         y = z - h
         
-        # 4. Jacobienne H (6×16)
-        H = np.zeros((6, 16))
+        # 4. Jacobienne H (19)
+        H = np.zeros((6, 19))
         H[0:3, 4:7] = np.eye(3)
         H[3:6, 7:10] = np.eye(3)
         
@@ -409,13 +428,13 @@ class EKF:
         
         # 6. Gain de Kalman
         K = self.P @ H.T @ np.linalg.inv(S)
-        assert K.shape == (16,6)
+        assert K.shape == (19,6)
         
         # 7. Update état
         self.x = self.x + K @ y
         
         # 8. Update covariance
-        I_KH = np.eye(16) - K @ H
+        I_KH = np.eye(19) - K @ H
         self.P = I_KH @ self.P
 
         # 9. Normaliser quaternion après update
@@ -462,20 +481,20 @@ class EKF:
         # Full Jacobian H (3×16):
         # [H_q(3×4), zeros(3×3), zeros(3×3), zeros(3×3), I(3×3)]
         #  quat      pos         vel         bg          ba
-        H = np.zeros((3, 16))
+        H = np.zeros((3, 19))
         H[:, 0:4] = H_q              # ∂h/∂q
         H[:, 13:16] = np.eye(3)      # ∂h/∂b_accel = I(3×3)
 
         S = H @ self.P @ H.T + self.R_accel
 
         K = self.P @ H.T @ np.linalg.inv(S)
-        assert K.shape == (16,3)
+        assert K.shape == (19,3)
 
         self.x = self.x + K @ y
         self.x[0:4] = self.x[0:4] / np.linalg.norm(self.x[0:4])
         self._enforce_quaternion_continuity()
 
-        I_KH = np.eye(16) - K @ H
+        I_KH = np.eye(19) - K @ H
         self.P = I_KH @ self.P
     
     
@@ -547,13 +566,13 @@ class EKF:
         
         # 9. Gain de Kalman
         K = self.P @ H.T @ np.linalg.inv(S)
-        assert K.shape == (16,1)
+        assert K.shape == (19,1)
         
         # 10. Update état
         self.x = self.x + K @ y
         
         # 11. Update covariance
-        I_KH = np.eye(16) - K @ H
+        I_KH = np.eye(19) - K @ H
         self.P = I_KH @ self.P
 
         # 12. Normaliser quaternion
@@ -561,49 +580,78 @@ class EKF:
         self._enforce_quaternion_continuity()
 
     def update_heading_mag(self, mag_meas):
+        """
+        Update EKF avec magnétomètre - ESTIME B_NED en même temps que q.
+        """
         if not self.isInitialized:
             return
         
+        # 1. Normaliser mesure
         mag_norm = np.linalg.norm(mag_meas)
         if mag_norm < 1e-6:
             return
         
         mag_n = mag_meas / mag_norm
-        mag_ref_n = self.mag_ref / np.linalg.norm(self.mag_ref)
         
+        # 2. ✅ Utiliser B_NED estimé (état)
+        B_NED_est = self.x[16:19]
+        B_NED_norm = np.linalg.norm(B_NED_est)
+        if B_NED_norm < 1e-6:
+            return
+        B_NED_n = B_NED_est / B_NED_norm
+        
+        # 3. Prédiction
         q = self.x[0:4]
         R = Utils.quaternion_to_rotation_matrix(q)
-        h = R.T @ mag_ref_n
+        h = R.T @ B_NED_n  # NED → body
         h = h / np.linalg.norm(h)
         
+        # 4. Innovation
         z = mag_n
         y = z - h
         
-        # ✅ JACOBIENNE PAR DIFFÉRENCES FINIES (correcte par construction)
+        # 5. ✅ JACOBIENNE PAR DIFFÉRENCES FINIES (q ET B_NED)
         q_flat = q.flatten()
+        B_flat = B_NED_n.flatten()
         epsilon = 1e-7
-        H_q = np.zeros((3, 4))
         
+        # Jacobienne ∂h/∂q (3×4)
+        H_q = np.zeros((3, 4))
         for i in range(4):
             q_plus = q_flat.copy()
             q_plus[i] += epsilon
             q_plus = q_plus / np.linalg.norm(q_plus)
             
             R_plus = Utils.quaternion_to_rotation_matrix(q_plus.reshape(4,1))
-            h_plus = R_plus.T @ mag_ref_n
+            h_plus = R_plus.T @ B_NED_n
             h_plus = h_plus.flatten() / np.linalg.norm(h_plus)
             
             H_q[:, i] = (h_plus - h.flatten()) / epsilon
         
-        H = np.zeros((3, 16))
-        H[:, 0:4] = H_q
+        # ✅ Jacobienne ∂h/∂B_NED (3×3)
+        H_B = np.zeros((3, 3))
+        for i in range(3):
+            B_plus = B_flat.copy()
+            B_plus[i] += epsilon
+            B_plus = B_plus / np.linalg.norm(B_plus)
+            
+            h_plus = R.T @ B_plus.reshape(3,1)
+            h_plus = h_plus.flatten() / np.linalg.norm(h_plus)
+            
+            H_B[:, i] = (h_plus - h.flatten()) / epsilon
         
-        # ✅ GATING STRICT sur innovation
+        # ✅ Jacobienne complète H (3×19)
+        H = np.zeros((3, 19))
+        H[:, 0:4] = H_q         # ∂h/∂q
+        H[:, 16:19] = H_B       # ∂h/∂B_NED
+        
+        # 6. Gating
         innovation_norm = np.linalg.norm(y)
-        if innovation_norm > 0.3:  # Réduit de 0.5 à 0.3 (≈17° max)
-            print(f"⚠️ Mag innovation: {np.rad2deg(innovation_norm):.1f}° > 17° → skip")
+        if innovation_norm > 0.5:  # 30° max
+            print(f"⚠️ Mag innovation: {np.rad2deg(innovation_norm):.1f}° > 30° → skip")
             return
         
+        # 7. Covariances
         S = H @ self.P @ H.T + np.diag([self.R_heading_mag]*3)
         
         try:
@@ -611,17 +659,28 @@ class EKF:
         except np.linalg.LinAlgError:
             return
         
-        # ✅ SATURER LE GAIN (éviter corrections brutales)
-        K_max = 0.1  # Limiter l'agressivité
-        K[0:4, :] = np.clip(K[0:4, :], -K_max, K_max)
+        assert K.shape == (19, 3)
         
+        # 8. Saturer gain quaternion (pas B_NED)
+        K[0:4, :] = np.clip(K[0:4, :], -0.1, 0.1)
+        
+        # 9. Update état
         self.x = self.x + K @ y
-        self.x[0:4] = self.x[0:4] / np.linalg.norm(self.x[0:4])
-        self._enforce_quaternion_continuity()
         
-        # Joseph form
-        I_KH = np.eye(16) - K @ H
+        # 10. Normaliser quaternion ET B_NED
+        self.x[0:4] = self.x[0:4] / np.linalg.norm(self.x[0:4])
+        
+        # ✅ Normaliser B_NED (intensité doit rester ~1.0)
+        B_norm = np.linalg.norm(self.x[16:19])
+        if B_norm > 0.1:  # Éviter division par zéro
+            self.x[16:19] = self.x[16:19] / B_norm
+        
+        # 11. Update covariance (Joseph form)
+        I_KH = np.eye(19) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ np.diag([self.R_heading_mag]*3) @ K.T
+        
+        # 12. Forcer continuité quaternion
+        self._enforce_quaternion_continuity()
 
 
     def _enforce_quaternion_continuity(self):
